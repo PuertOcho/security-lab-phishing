@@ -1,0 +1,4 @@
+certs/
+bin/
+captured.log
+__pycache__/
