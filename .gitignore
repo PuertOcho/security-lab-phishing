@@ -1,4 +1,7 @@
 certs/
 bin/
 captured.log
+access.log
 __pycache__/
+site/
+dnsmasq.conf

