@@ -6,9 +6,11 @@
 # dispositivo de la red de pruebas cuyo DNS apunte a esta máquina verá el
 # CLON en vez de la página real de Google.
 #
-#   ./dns.sh up      -> arranca dnsmasq (pide sudo)
-#   ./dns.sh down    -> lo para
-#   ./dns.sh status  -> muestra estado y la regla activa
+#   ./dns.sh up [dominio extra ...]  -> arranca dnsmasq (pide sudo); opcional-
+#                                       mente hijack de más dominios (para
+#                                       clonar otras páginas bajo su dominio)
+#   ./dns.sh down                    -> lo para (sin sudo: corre como tu usuario)
+#   ./dns.sh status                  -> muestra estado y la regla activa
 #
 # El dominio real se redirige solo DENTRO de tu red: en el resto del mundo
 # policies.google.com sigue resolviendo a Google. Nunca uses esto fuera de
@@ -16,13 +18,21 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+EXTRA_DOMAINS=("${@:2}")
+
 LAN_IFACE="$(ip route | awk '/default/ {print $5; exit}')"
 LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)"
 
 CONF_FILE="$PWD/dnsmasq.conf"
 PID_FILE="/tmp/dnsmasq-phishing.pid"
+LOG_FILE="$PWD/dnsmasq.log"
 
 gen_conf() {
+  local rules=""
+  local d
+  for d in policies.google.com www.policies.google.com ${EXTRA_DOMAINS[@]+"${EXTRA_DOMAINS[@]}"}; do
+    rules+="address=/$d/$LAN_IP"$'\n'
+  done
   cat > "$CONF_FILE" <<EOF
 # Generado por dns.sh — laboratorio de phishing, solo red propia.
 # NO usar fuera de una red controlada.
@@ -33,38 +43,54 @@ no-resolv
 # El resto del tráfico DNS va al resolver de Cloudflare (o el que prefieras)
 server=1.1.1.1
 server=8.8.8.8
-# Hijack del dominio real hacia el clon local
-address=/policies.google.com/$LAN_IP
-address=/www.policies.google.com/$LAN_IP
+# Hijack de los dominios del lab hacia el clon local
+$rules
 EOF
   echo "config escrito en $CONF_FILE (interface=$LAN_IFACE, ip=$LAN_IP)"
+  echo "dominios: policies.google.com www.policies.google.com ${EXTRA_DOMAINS[*]:-}"
+}
+
+# vivo si el pid del pid-file sigue existiendo
+running() {
+  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
 }
 
 case "${1:-status}" in
   up)
     [ -n "$LAN_IP" ] || { echo "no se pudo detectar la IP de LAN"; exit 1; }
+    if running; then
+      echo "dnsmasq ya estaba activo (pid $(cat "$PID_FILE")) — para recargar: ./dns.sh down && ./dns.sh up ..."
+      exit 0
+    fi
     gen_conf
     echo "arrancando dnsmasq (sudo)..."
+    # Modo daemon (sin --no-daemon): escribe el pid-file de forma fiable.
+    # --user=$(id -un) hace que dnsmasq suelte root tras arrancar y quede como
+    # tu usuario: ./dns.sh down puede pararlo con kill normal, sin sudo.
     sudo dnsmasq --conf-file="$CONF_FILE" --pid-file="$PID_FILE" \
-      --log-facility=- --no-daemon 2>/dev/null &
-    # dnsmasq con --no-daemon y & no escribe pid-file correctamente; usamos pgrep
+      --user="$(id -un)" --log-facility="$LOG_FILE"
     sleep 1
-    echo "dnsmasq en marcha. Clientes de prueba: apuntad su DNS a $LAN_IP"
+    running || { echo "dnsmasq no arrancó — mira $LOG_FILE"; exit 1; }
+    echo "dnsmasq en marcha (pid $(cat "$PID_FILE"))."
+    echo "clientes de prueba: usar $LAN_IP como DNS"
+    echo "comprobación: nslookup policies.google.com $LAN_IP"
     ;;
   down)
-    sudo pkill -f "dnsmasq.*dnsmasq-phishing" 2>/dev/null \
-      || sudo pkill dnsmasq 2>/dev/null \
-      || echo "dnsmasq ya estaba parado"
+    if running; then
+      kill "$(cat "$PID_FILE")"
+      echo "dnsmasq parado"
+    else
+      echo "dnsmasq ya estaba parado"
+    fi
     rm -f "$PID_FILE"
-    echo "dnsmasq parado"
     ;;
   status)
-    if pgrep -f "dnsmasq.*phishing" >/dev/null 2>&1 || [ -f "$PID_FILE" ]; then
-      echo "dnsmasq activo — policies.google.com -> $LAN_IP"
+    if running; then
+      echo "dnsmasq activo (pid $(cat "$PID_FILE")) — policies.google.com -> $LAN_IP"
     else
       echo "dnsmasq parado"
     fi
     ;;
   *)
-    echo "uso: $0 {up|down|status}"; exit 1 ;;
+    echo "uso: $0 {up [dominio...]|down|status}"; exit 1 ;;
 esac

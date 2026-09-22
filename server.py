@@ -10,6 +10,10 @@ store of your own machine — which is the whole lesson: the padlock proves
 the connection is encrypted to a server your device trusts, NOT that the
 site is the real one.
 
+The server also serves the PUBLIC CA certificate at /rootCA.pem so other
+lab devices can download and install it (only the public cert — never the
+CA private key leaves your machine).
+
 Authorized use only:
   - Run it only inside a network you own, against test machines you control.
   - This is a training clone: never repoint traffic from machines or users
@@ -20,7 +24,12 @@ Usage:
 Environment:
   LAB_HOST           bind address (default 127.0.0.1)
   LAB_CERT, LAB_KEY  TLS cert/key files (HTTPS when both exist)
+  LAB_CA_FILE        public CA cert served at /rootCA.pem
+                     (default: rootCA.pem next to LAB_CERT)
   LAB_SITE_DIR       directory holding the cloned site (default ./site)
+  LAB_LANDING_PAGE   cloned page (path under LAB_SITE_DIR) served at "/"
+                     (default: the path recorded in site/.landing by
+                     clone.sh, falling back to the Google ToS clone)
   LAB_REDIRECT_URL   if set, GET / issues a 302 here instead of serving the
                      clone (realistic "harvester" mode: the visitor is sent
                      to the real page and never sees the clone)
@@ -40,13 +49,37 @@ HOST = os.environ.get("LAB_HOST", "127.0.0.1")
 DEFAULT_PORT = 8080
 
 SITE_DIR = os.environ.get("LAB_SITE_DIR", "site")
-# Path (inside SITE_DIR) of the cloned page to serve as the root.
-LANDING_PAGE = "policies.google.com/terms.html"
+# Path (inside SITE_DIR) of the cloned page to serve as the root. Priority:
+# LAB_LANDING_PAGE env > site/.landing (written by clone.sh on every run) >
+# the default Google ToS clone. Resolved lazily so a re-clone is picked up
+# without restarting the container.
+DEFAULT_LANDING_PAGE = "policies.google.com/terms.html"
+
+
+def landing_page():
+    env = os.environ.get("LAB_LANDING_PAGE", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.join(SITE_DIR, ".landing"), encoding="utf-8") as fh:
+            recorded = fh.read().strip()
+        if recorded:
+            return recorded
+    except OSError:
+        pass
+    return DEFAULT_LANDING_PAGE
+
 
 # If both files exist, the server serves over HTTPS. Generate them with mkcert
 # so the local CA is trusted and the browser shows a valid padlock.
 CERT_FILE = os.environ.get("LAB_CERT", "cert.pem")
 KEY_FILE = os.environ.get("LAB_KEY", "key.pem")
+
+# PUBLIC certificate of the local CA (the private key never goes here): served
+# at /rootCA.pem so test devices can install it and see the padlock.
+CA_FILE = os.environ.get(
+    "LAB_CA_FILE", os.path.join(os.path.dirname(CERT_FILE) or ".", "rootCA.pem")
+)
 
 # When set, GET / returns a 302 to this URL instead of the clone (harvester
 # mode). When empty, the lab serves the clone itself.
@@ -62,7 +95,7 @@ BANNER_HTML = (
     "background:#b91c1c;color:#fff;font:600 14px/1.4 system-ui,Arial,sans-serif;"
     "text-align:center;padding:8px 16px;\">"
     "&#9888; CLON DE LABORATORIO &mdash; p&aacute;gina clonada con fines educativos, "
-    "NO es policies.google.com real</div>"
+    "NO es el sitio real</div>"
 )
 
 # Request log (one line per GET) — keeps a local record of what was fetched.
@@ -71,6 +104,11 @@ ACCESS_LOG = "access.log"
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        base = self.path.partition("?")[0]
+        if base in ("/rootCA.pem", "/ca.pem"):
+            self._serve_ca()
+            return
+
         if REDIRECT_URL and self.path in ("/", "/index.html"):
             self.send_response(302)
             self.send_header("Location", REDIRECT_URL)
@@ -79,7 +117,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._log(f"302 -> {REDIRECT_URL}")
             return
 
-        target = self._resolve_path(self.path)
+        target = self._resolve_path(self.path, self.headers.get("Host", ""))
         if target is None:
             self.send_error(404, "Not Found")
             self._log("404")
@@ -113,6 +151,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
         self._log(f"200 {ctype}")
 
+    def _serve_ca(self):
+        """Serve the PUBLIC CA certificate so lab devices can install it."""
+        try:
+            with open(CA_FILE, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self.send_error(404, "rootCA.pem not found — run ./setup.sh")
+            self._log("404 ca")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-x509-ca-cert")
+        self.send_header("Content-Disposition", 'attachment; filename="rootCA.pem"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        self._log("200 ca")
+
     def _inject_banner(self, data):
         """Insert the clone banner right after <body ...> (or prepend)."""
         banner = BANNER_HTML.encode("utf-8")
@@ -124,37 +179,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return data[: close + 1] + banner + data[close + 1 :]
         return banner + data
 
-    def _resolve_path(self, raw_path):
+    def _resolve_path(self, raw_path, host=""):
         """Map a request path to a file under SITE_DIR, or None.
 
-        The clone is laid out by domain (wget --mirror): the landing page
-        lives at SITE_DIR/policies.google.com/terms.html and its assets are
-        referenced with paths like /www.gstatic.com/... so we serve SITE_DIR
-        as the document root and alias the root URL to the landing page.
+        The clone is laid out by domain (wget --mirror): files live at
+        SITE_DIR/<host>/<path>. Two access styles must work:
+          - lab URLs/IP: the domain is embedded in the path
+            (/example.com/index.html, /www.gstatic.com/...);
+          - hijacked real domain: the browser sends Host: <host> and a plain
+            /<path>, so the request Host is prepended to find the file.
+        The root URL serves the landing page recorded in site/.landing.
         """
         path, _, query = raw_path.partition("?")
         path = urllib.parse.unquote(path)
+        host = host.partition(":")[0].lower()
 
+        landing = landing_page()
         if path in ("/", "/index.html", "/terms", "/terms.html"):
-            candidate = os.path.join(SITE_DIR, LANDING_PAGE)
+            # Under a hijacked domain prefer that domain's own index page.
+            if host and path in ("/", "/index.html"):
+                own = os.path.join(SITE_DIR, host, "index.html")
+                if os.path.isfile(own):
+                    return own
+            candidate = os.path.join(SITE_DIR, landing)
             return candidate if os.path.isfile(candidate) else None
 
-        # Strip a leading slash and resolve relative to SITE_DIR.
-        rel = path.lstrip("/") or LANDING_PAGE
-        candidate = os.path.join(SITE_DIR, rel)
+        rel = path.lstrip("/")
+        bases = []
+        if host:
+            bases.append(os.path.join(SITE_DIR, host, rel))
+        bases.append(os.path.join(SITE_DIR, rel))
 
-        # wget --adjust-extension names query-variant files literally with a
-        # '?' in the filename (e.g. "index.html?lfhs=2.html"). Fall back to
-        # that literal form when the plain path is missing.
-        if os.path.isfile(candidate):
-            return candidate
-        if query and os.path.isfile(candidate + "?" + query):
-            return candidate + "?" + query
-        # Directory -> index.html
-        if os.path.isdir(candidate):
-            idx = os.path.join(candidate, "index.html")
-            if os.path.isfile(idx):
-                return idx
+        for base in bases:
+            # wget --adjust-extension appends .html to extension-less URLs
+            # ("/help/x" -> "help/x.html"), and names query-variant files
+            # literally with a '?' in the name ("index.html?lfhs=2.html").
+            for candidate in (base, base + ".html"):
+                if os.path.isfile(candidate):
+                    return candidate
+                if query and os.path.isfile(candidate + "?" + query):
+                    return candidate + "?" + query
+                # Directory -> index.html
+                if os.path.isdir(candidate):
+                    idx = os.path.join(candidate, "index.html")
+                    if os.path.isfile(idx):
+                        return idx
         return None
 
     def _log(self, what):
@@ -166,7 +235,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass  # Silence default request logging; our own _log is explicit.
-
 
 def main():
     tls = os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)
@@ -194,7 +262,6 @@ def main():
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nStopped.")
-
 
 if __name__ == "__main__":
     main()

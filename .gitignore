@@ -1,6 +1,6 @@
 certs/
 bin/
-captured.log
+dnsmasq.log
 access.log
 __pycache__/
 site/

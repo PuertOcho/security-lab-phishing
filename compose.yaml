@@ -14,6 +14,9 @@ services:
       LAB_CERT: /certs/server.pem
       LAB_KEY: /certs/server.key
       LAB_SITE_DIR: /app/site
+      # Página clonada servida en "/": clone.sh la registra en site/.landing.
+      # Para forzar otra, p. ej.: LAB_LANDING_PAGE: policies.google.com/privacy.html
+      LAB_LANDING_PAGE: ${LAB_LANDING_PAGE:-}
       # El banner rojo "CLON DE LABORATORIO" se inyecta en cada HTML servido.
       # Para un test a ciegas (sin marca visible) ponlo a 0:
       # LAB_BANNER: "0"
